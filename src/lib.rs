@@ -31,6 +31,7 @@ mod types;
 pub use client::{EventSubscription, IndexerClient, StatusSubscription};
 pub use error::{IndexerApiError, ServerError};
 pub use types::{
-    Bytes32, CustomKey, CustomValue, DecodedEvent, EventMeta, EventNotification, EventRef,
-    EventsResponse, Key, PalletMeta, Span, StatusUpdate, SubscriptionTarget, U128Text, U64Text,
+    Bytes32, CustomKey, CustomValue, DecodedEvent, EventMatch, EventMeta, EventNotification,
+    EventRef, EventsResponse, Key, PalletMeta, Span, StatusUpdate, StoredEvent,
+    SubscriptionTarget, U128Text, U64Text,
 };

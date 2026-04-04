@@ -47,6 +47,8 @@ The crate exports these main public types from `src/lib.rs`:
 - `Span`
 - `EventRef`
 - `DecodedEvent`
+- `StoredEvent`
+- `EventMatch`
 - `EventsResponse`
 - `EventNotification`
 - `StatusUpdate`
@@ -81,6 +83,7 @@ Behavior:
 - opens a WebSocket connection to the given URL
 - starts an internal background reader task
 - returns a cloneable `IndexerClient`
+- intended to be reused for both one-shot requests and subscriptions on the same connection
 
 ## One-Shot Requests
 
@@ -217,7 +220,46 @@ pub struct EventRef {
 pub struct DecodedEvent {
     pub block_number: u32,
     pub event_index: u16,
-    pub event: serde_json::Value,
+    pub event: StoredEvent,
+}
+
+pub struct StoredEvent {
+    pub spec_version: u32,
+    pub pallet_name: String,
+    pub event_name: String,
+    pub pallet_index: u8,
+    pub variant_index: u8,
+    pub event_index: u16,
+    pub fields: serde_json::Value,
+}
+```
+
+Helpers:
+
+```rust
+impl DecodedEvent {
+    pub fn pallet_name(&self) -> &str
+    pub fn event_name(&self) -> &str
+    pub fn variant(&self) -> (u8, u8)
+    pub fn field(&self, name: &str) -> Option<&serde_json::Value>
+}
+
+impl StoredEvent {
+    pub fn variant(&self) -> (u8, u8)
+    pub fn field(&self, name: &str) -> Option<&serde_json::Value>
+}
+```
+
+Correlated event view:
+
+```rust
+pub struct EventMatch {
+    pub event_ref: EventRef,
+    pub decoded_event: Option<DecodedEvent>,
+}
+
+impl EventsResponse {
+    pub fn event_matches(&self) -> Vec<EventMatch>
 }
 ```
 
@@ -242,6 +284,12 @@ let response = client
 
 println!("{} raw event refs", response.events.len());
 println!("{} decoded events", response.decoded_events.len());
+
+for event_match in response.event_matches() {
+    if let Some(decoded) = event_match.decoded_event {
+        println!("{}::{}", decoded.pallet_name(), decoded.event_name());
+    }
+}
 ```
 
 ## Subscriptions
@@ -260,7 +308,14 @@ pub async fn subscribe_status(&self) -> Result<StatusSubscription, IndexerApiErr
 
 ```rust
 pub async fn next(&mut self) -> Option<Result<StatusUpdate, IndexerApiError>>
+pub async fn unsubscribe(self) -> Result<(), IndexerApiError>
 ```
+
+Notes:
+
+- dropping a `StatusSubscription` removes only that local receiver
+- `unsubscribe()` also sends `UnsubscribeStatus` to the server
+- `IndexerClient::unsubscribe_status()` removes all local status subscribers for that client connection and unsubscribes the shared server-side status subscription
 
 `StatusUpdate`:
 
@@ -310,7 +365,15 @@ pub async fn subscribe_events(&self, key: Key) -> Result<EventSubscription, Inde
 
 ```rust
 pub async fn next(&mut self) -> Option<Result<EventNotification, IndexerApiError>>
+pub async fn unsubscribe(self) -> Result<(), IndexerApiError>
 ```
+
+Notes:
+
+- dropping an `EventSubscription` removes only that local receiver
+- notifications are delivered only to local subscribers whose `Key` matches the incoming notification key
+- `unsubscribe()` also sends `UnsubscribeEvents` for that key to the server
+- `IndexerClient::unsubscribe_events(key)` removes all local subscribers for that key and unsubscribes that key on the server for the shared connection
 
 `EventNotification`:
 
@@ -446,7 +509,7 @@ pub enum IndexerApiError {
     WebSocket(tokio_tungstenite::tungstenite::Error),
     Json(serde_json::Error),
     RequestCancelled { request_id: u64 },
-    RequestChannelClosed { request_id: u64 },
+    ResponseChannelClosed { request_id: u64 },
     Server { code: String, message: String },
     StatusSubscriptionTerminated { reason: String, message: String },
     EventSubscriptionTerminated { reason: String, message: String },
@@ -469,6 +532,8 @@ pub enum IndexerApiError {
   - the server terminated the event subscription
 - `ConnectionClosed`
   - the socket closed while waiting for traffic
+- `ResponseChannelClosed { .. }`
+  - the client-side waiter was dropped before a response arrived
 - `RequestCancelled { .. }`
   - pending request was cancelled because the background connection ended
 
@@ -507,7 +572,6 @@ Incoming protocol messages are interpreted as follows:
 The crate intentionally exposes a high-level API only.
 
 - it does not expose raw request/response wire enums publicly
-- it does not currently provide helper constructors for common keys like `ref_index` or `item_id`
 - it assumes Tokio and `tokio-tungstenite`
 
 ## Testing

@@ -15,21 +15,34 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 type PendingSender = oneshot::Sender<Result<Envelope, IndexerApiError>>;
+type StatusSubscribers = Arc<Mutex<HashMap<u64, mpsc::Sender<Result<StatusUpdate, IndexerApiError>>>>>;
+type EventSubscribers = Arc<Mutex<HashMap<u64, EventSubscriber>>>;
+
+#[derive(Clone)]
+struct EventSubscriber {
+    key: Key,
+    sender: mpsc::Sender<Result<EventNotification, IndexerApiError>>,
+}
 
 #[derive(Clone)]
 pub struct IndexerClient {
     writer: Arc<Mutex<futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>>>,
     pending: Arc<Mutex<HashMap<u64, PendingSender>>>,
-    status_subscribers: Arc<Mutex<Vec<mpsc::Sender<Result<StatusUpdate, IndexerApiError>>>>>,
-    event_subscribers: Arc<Mutex<Vec<mpsc::Sender<Result<EventNotification, IndexerApiError>>>>>,
+    status_subscribers: StatusSubscribers,
+    event_subscribers: EventSubscribers,
     next_id: Arc<AtomicU64>,
 }
 
 pub struct StatusSubscription {
+    client: IndexerClient,
+    id: u64,
     receiver: mpsc::Receiver<Result<StatusUpdate, IndexerApiError>>,
 }
 
 pub struct EventSubscription {
+    client: IndexerClient,
+    id: u64,
+    key: Key,
     receiver: mpsc::Receiver<Result<EventNotification, IndexerApiError>>,
 }
 
@@ -41,8 +54,8 @@ impl IndexerClient {
         let client = Self {
             writer: Arc::new(Mutex::new(writer)),
             pending: Arc::new(Mutex::new(HashMap::new())),
-            status_subscribers: Arc::new(Mutex::new(Vec::new())),
-            event_subscribers: Arc::new(Mutex::new(Vec::new())),
+            status_subscribers: Arc::new(Mutex::new(HashMap::new())),
+            event_subscribers: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
         };
 
@@ -85,12 +98,17 @@ impl IndexerClient {
 
     pub async fn subscribe_status(&self) -> Result<StatusSubscription, IndexerApiError> {
         let (tx, rx) = mpsc::channel(32);
-        self.status_subscribers.lock().await.push(tx);
+        let subscription_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.status_subscribers.lock().await.insert(subscription_id, tx);
 
         let envelope = self.request("SubscribeStatus", EmptyPayload::default()).await?;
         let _ = expect_payload::<SubscriptionStatusPayload>(envelope, "subscriptionStatus")?;
 
-        Ok(StatusSubscription { receiver: rx })
+        Ok(StatusSubscription {
+            client: self.clone(),
+            id: subscription_id,
+            receiver: rx,
+        })
     }
 
     pub async fn unsubscribe_status(&self) -> Result<(), IndexerApiError> {
@@ -102,23 +120,46 @@ impl IndexerClient {
 
     pub async fn subscribe_events(&self, key: Key) -> Result<EventSubscription, IndexerApiError> {
         let (tx, rx) = mpsc::channel(32);
-        self.event_subscribers.lock().await.push(tx);
+        let subscription_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.event_subscribers.lock().await.insert(
+            subscription_id,
+            EventSubscriber {
+                key: key.clone(),
+                sender: tx,
+            },
+        );
 
         let envelope = self
-            .request("SubscribeEvents", SubscribeEventsPayload { key })
+            .request("SubscribeEvents", SubscribeEventsPayload { key: key.clone() })
             .await?;
         let _ = expect_payload::<SubscriptionStatusPayload>(envelope, "subscriptionStatus")?;
 
-        Ok(EventSubscription { receiver: rx })
+        Ok(EventSubscription {
+            client: self.clone(),
+            id: subscription_id,
+            key,
+            receiver: rx,
+        })
     }
 
     pub async fn unsubscribe_events(&self, key: Key) -> Result<(), IndexerApiError> {
         let envelope = self
-            .request("UnsubscribeEvents", SubscribeEventsPayload { key })
+            .request("UnsubscribeEvents", SubscribeEventsPayload { key: key.clone() })
             .await?;
         let _ = expect_payload::<SubscriptionStatusPayload>(envelope, "subscriptionStatus")?;
-        self.event_subscribers.lock().await.clear();
+        self.event_subscribers
+            .lock()
+            .await
+            .retain(|_, subscriber| subscriber.key != key);
         Ok(())
+    }
+
+    async fn unregister_status_subscription(&self, id: u64) {
+        self.status_subscribers.lock().await.remove(&id);
+    }
+
+    async fn unregister_event_subscription(&self, id: u64) {
+        self.event_subscribers.lock().await.remove(&id);
     }
 
     async fn request<T>(&self, message_type: &'static str, payload: T) -> Result<Envelope, IndexerApiError>
@@ -143,7 +184,7 @@ impl IndexerClient {
 
         match rx.await {
             Ok(result) => result,
-            Err(_) => Err(IndexerApiError::RequestChannelClosed { request_id: id }),
+            Err(_) => Err(IndexerApiError::ResponseChannelClosed { request_id: id }),
         }
     }
 }
@@ -152,19 +193,56 @@ impl StatusSubscription {
     pub async fn next(&mut self) -> Option<Result<StatusUpdate, IndexerApiError>> {
         self.receiver.recv().await
     }
+
+    pub async fn unsubscribe(self) -> Result<(), IndexerApiError> {
+        let client = self.client.clone();
+        let id = self.id;
+        let result = client.unsubscribe_status().await;
+        client.unregister_status_subscription(id).await;
+        result
+    }
 }
 
 impl EventSubscription {
     pub async fn next(&mut self) -> Option<Result<EventNotification, IndexerApiError>> {
         self.receiver.recv().await
     }
+
+    pub async fn unsubscribe(self) -> Result<(), IndexerApiError> {
+        let client = self.client.clone();
+        let id = self.id;
+        let key = self.key.clone();
+        let result = client.unsubscribe_events(key).await;
+        client.unregister_event_subscription(id).await;
+        result
+    }
+}
+
+impl Drop for StatusSubscription {
+    fn drop(&mut self) {
+        let client = self.client.clone();
+        let id = self.id;
+        tokio::spawn(async move {
+            client.unregister_status_subscription(id).await;
+        });
+    }
+}
+
+impl Drop for EventSubscription {
+    fn drop(&mut self) {
+        let client = self.client.clone();
+        let id = self.id;
+        tokio::spawn(async move {
+            client.unregister_event_subscription(id).await;
+        });
+    }
 }
 
 async fn run_reader(
     mut reader: futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
     pending: Arc<Mutex<HashMap<u64, PendingSender>>>,
-    status_subscribers: Arc<Mutex<Vec<mpsc::Sender<Result<StatusUpdate, IndexerApiError>>>>>,
-    event_subscribers: Arc<Mutex<Vec<mpsc::Sender<Result<EventNotification, IndexerApiError>>>>>,
+    status_subscribers: StatusSubscribers,
+    event_subscribers: EventSubscribers,
 ) {
     while let Some(message) = reader.next().await {
         match handle_message(message, &pending, &status_subscribers, &event_subscribers).await {
@@ -187,8 +265,8 @@ async fn run_reader(
 async fn handle_message(
     message: Result<Message, tokio_tungstenite::tungstenite::Error>,
     pending: &Arc<Mutex<HashMap<u64, PendingSender>>>,
-    status_subscribers: &Arc<Mutex<Vec<mpsc::Sender<Result<StatusUpdate, IndexerApiError>>>>>,
-    event_subscribers: &Arc<Mutex<Vec<mpsc::Sender<Result<EventNotification, IndexerApiError>>>>>,
+    status_subscribers: &StatusSubscribers,
+    event_subscribers: &EventSubscribers,
 ) -> Result<(), IndexerApiError> {
     let payload = match message? {
         Message::Text(text) => text.to_string(),
@@ -312,68 +390,76 @@ async fn fail_all_pending(
 }
 
 async fn broadcast_status_update(
-    subscribers: &Arc<Mutex<Vec<mpsc::Sender<Result<StatusUpdate, IndexerApiError>>>>>,
+    subscribers: &StatusSubscribers,
     update: StatusUpdate,
 ) {
     let mut subscribers = subscribers.lock().await;
-    let mut next = Vec::with_capacity(subscribers.len());
-    for subscriber in subscribers.drain(..) {
-        if subscriber.send(Ok(update.clone())).await.is_ok() {
-            next.push(subscriber);
+    let ids: Vec<u64> = subscribers.keys().copied().collect();
+    for id in ids {
+        let Some(subscriber) = subscribers.get(&id).cloned() else {
+            continue;
+        };
+        if subscriber.send(Ok(update.clone())).await.is_err() {
+            subscribers.remove(&id);
         }
     }
-    *subscribers = next;
 }
 
 async fn broadcast_event_update(
-    subscribers: &Arc<Mutex<Vec<mpsc::Sender<Result<EventNotification, IndexerApiError>>>>>,
+    subscribers: &EventSubscribers,
     update: EventNotification,
 ) {
     let mut subscribers = subscribers.lock().await;
-    let mut next = Vec::with_capacity(subscribers.len());
-    for subscriber in subscribers.drain(..) {
-        if subscriber.send(Ok(update.clone())).await.is_ok() {
-            next.push(subscriber);
+    let ids: Vec<u64> = subscribers.keys().copied().collect();
+    for id in ids {
+        let Some(subscriber) = subscribers.get(&id).cloned() else {
+            continue;
+        };
+        if subscriber.key == update.key && subscriber.sender.send(Ok(update.clone())).await.is_err() {
+            subscribers.remove(&id);
         }
     }
-    *subscribers = next;
 }
 
 async fn broadcast_status_error(
-    subscribers: &Arc<Mutex<Vec<mpsc::Sender<Result<StatusUpdate, IndexerApiError>>>>>,
+    subscribers: &StatusSubscribers,
     error: &IndexerApiError,
 ) {
     let mut subscribers = subscribers.lock().await;
-    let mut next = Vec::new();
-    for subscriber in subscribers.drain(..) {
-        if subscriber.send(Err(clone_error(error))).await.is_ok() {
-            next.push(subscriber);
+    let ids: Vec<u64> = subscribers.keys().copied().collect();
+    for id in ids {
+        let Some(subscriber) = subscribers.get(&id).cloned() else {
+            continue;
+        };
+        if subscriber.send(Err(clone_error(error))).await.is_err() {
+            subscribers.remove(&id);
         }
     }
-    *subscribers = next;
 }
 
 async fn broadcast_event_error(
-    subscribers: &Arc<Mutex<Vec<mpsc::Sender<Result<EventNotification, IndexerApiError>>>>>,
+    subscribers: &EventSubscribers,
     error: &IndexerApiError,
 ) {
     let mut subscribers = subscribers.lock().await;
-    let mut next = Vec::new();
-    for subscriber in subscribers.drain(..) {
-        if subscriber.send(Err(clone_error(error))).await.is_ok() {
-            next.push(subscriber);
+    let ids: Vec<u64> = subscribers.keys().copied().collect();
+    for id in ids {
+        let Some(subscriber) = subscribers.get(&id).cloned() else {
+            continue;
+        };
+        if subscriber.sender.send(Err(clone_error(error))).await.is_err() {
+            subscribers.remove(&id);
         }
     }
-    *subscribers = next;
 }
 
-fn clone_error(error: &IndexerApiError) -> IndexerApiError {
+    fn clone_error(error: &IndexerApiError) -> IndexerApiError {
     match error {
         IndexerApiError::Url(error) => IndexerApiError::Url(*error),
         IndexerApiError::WebSocket(_) => IndexerApiError::BackgroundTaskEnded,
         IndexerApiError::Json(error) => IndexerApiError::Json(serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))),
         IndexerApiError::RequestCancelled { request_id } => IndexerApiError::RequestCancelled { request_id: *request_id },
-        IndexerApiError::RequestChannelClosed { request_id } => IndexerApiError::RequestChannelClosed { request_id: *request_id },
+        IndexerApiError::ResponseChannelClosed { request_id } => IndexerApiError::ResponseChannelClosed { request_id: *request_id },
         IndexerApiError::Server { code, message } => IndexerApiError::Server { code: code.clone(), message: message.clone() },
         IndexerApiError::StatusSubscriptionTerminated { reason, message } => IndexerApiError::StatusSubscriptionTerminated { reason: reason.clone(), message: message.clone() },
         IndexerApiError::EventSubscriptionTerminated { reason, message } => IndexerApiError::EventSubscriptionTerminated { reason: reason.clone(), message: message.clone() },
@@ -382,10 +468,10 @@ fn clone_error(error: &IndexerApiError) -> IndexerApiError {
         IndexerApiError::ConnectionClosed => IndexerApiError::ConnectionClosed,
         IndexerApiError::BackgroundTaskEnded => IndexerApiError::BackgroundTaskEnded,
     }
-}
+    }
 
-#[cfg(test)]
-mod tests {
+    #[cfg(test)]
+    mod tests {
     use super::*;
     use crate::types::{CustomKey, CustomValue, DecodedEvent, Envelope, EventRef};
     use serde_json::json;
@@ -454,7 +540,15 @@ mod tests {
                 "decodedEvents": [{
                     "blockNumber": 50,
                     "eventIndex": 3,
-                    "event": {"palletName": "Referenda", "eventName": "Submitted"}
+                    "event": {
+                        "specVersion": 1234,
+                        "palletName": "Referenda",
+                        "eventName": "Submitted",
+                        "palletIndex": 42,
+                        "variantIndex": 0,
+                        "eventIndex": 3,
+                        "fields": {"index": 42}
+                    }
                 }]
             })),
         };
@@ -486,8 +580,8 @@ mod tests {
 
         runtime.block_on(async {
             let pending = Arc::new(Mutex::new(HashMap::new()));
-            let status_subscribers = Arc::new(Mutex::new(Vec::new()));
-            let event_subscribers = Arc::new(Mutex::new(Vec::new()));
+            let status_subscribers = Arc::new(Mutex::new(HashMap::new()));
+            let event_subscribers = Arc::new(Mutex::new(HashMap::new()));
             let (tx, rx) = oneshot::channel();
             pending.lock().await.insert(7, tx);
 
@@ -523,8 +617,8 @@ mod tests {
 
         runtime.block_on(async {
             let pending = Arc::new(Mutex::new(HashMap::new()));
-            let status_subscribers = Arc::new(Mutex::new(Vec::new()));
-            let event_subscribers = Arc::new(Mutex::new(Vec::new()));
+            let status_subscribers = Arc::new(Mutex::new(HashMap::new()));
+            let event_subscribers = Arc::new(Mutex::new(HashMap::new()));
             let (tx, rx) = oneshot::channel();
             pending.lock().await.insert(9, tx);
 
@@ -565,10 +659,10 @@ mod tests {
 
         runtime.block_on(async {
             let pending = Arc::new(Mutex::new(HashMap::new()));
-            let status_subscribers = Arc::new(Mutex::new(Vec::new()));
-            let event_subscribers = Arc::new(Mutex::new(Vec::new()));
+            let status_subscribers = Arc::new(Mutex::new(HashMap::new()));
+            let event_subscribers = Arc::new(Mutex::new(HashMap::new()));
             let (tx, mut rx) = mpsc::channel(1);
-            status_subscribers.lock().await.push(tx);
+            status_subscribers.lock().await.insert(1, tx);
 
             handle_message(
                 Ok(Message::Text(
@@ -600,10 +694,10 @@ mod tests {
 
         runtime.block_on(async {
             let pending = Arc::new(Mutex::new(HashMap::new()));
-            let status_subscribers = Arc::new(Mutex::new(Vec::new()));
-            let event_subscribers = Arc::new(Mutex::new(Vec::new()));
+            let status_subscribers = Arc::new(Mutex::new(HashMap::new()));
+            let event_subscribers = Arc::new(Mutex::new(HashMap::new()));
             let (tx, mut rx) = mpsc::channel(1);
-            event_subscribers.lock().await.push(tx);
+            event_subscribers.lock().await.insert(1, EventSubscriber { key: custom_u32_key("ref_index", 42), sender: tx });
 
             handle_message(
                 Ok(Message::Text(
@@ -641,12 +735,12 @@ mod tests {
 
         runtime.block_on(async {
             let pending = Arc::new(Mutex::new(HashMap::new()));
-            let status_subscribers = Arc::new(Mutex::new(Vec::new()));
-            let event_subscribers = Arc::new(Mutex::new(Vec::new()));
+            let status_subscribers = Arc::new(Mutex::new(HashMap::new()));
+            let event_subscribers = Arc::new(Mutex::new(HashMap::new()));
             let (status_tx, mut status_rx) = mpsc::channel(1);
             let (event_tx, mut event_rx) = mpsc::channel(1);
-            status_subscribers.lock().await.push(status_tx);
-            event_subscribers.lock().await.push(event_tx);
+            status_subscribers.lock().await.insert(1, status_tx);
+            event_subscribers.lock().await.insert(2, EventSubscriber { key: custom_u32_key("ref_index", 42), sender: event_tx });
 
             handle_message(
                 Ok(Message::Text(
@@ -694,8 +788,8 @@ mod tests {
 
         runtime.block_on(async {
             let pending = Arc::new(Mutex::new(HashMap::new()));
-            let status_subscribers = Arc::new(Mutex::new(Vec::new()));
-            let event_subscribers = Arc::new(Mutex::new(Vec::new()));
+            let status_subscribers = Arc::new(Mutex::new(HashMap::new()));
+            let event_subscribers = Arc::new(Mutex::new(HashMap::new()));
 
             let error = handle_message(
                 Ok(Message::Binary(vec![0xFF, 0xFE].into())),
@@ -783,13 +877,91 @@ mod tests {
             "decodedEvent": {
                 "blockNumber": 50,
                 "eventIndex": 3,
-                "event": {"palletName": "Content", "eventName": "PublishRevision"}
+                "event": {
+                    "specVersion": 1234,
+                    "palletName": "Content",
+                    "eventName": "PublishRevision",
+                    "palletIndex": 42,
+                    "variantIndex": 1,
+                    "eventIndex": 3,
+                    "fields": {}
+                }
             }
         }))
         .unwrap();
 
         assert_eq!(payload.event, EventRef { block_number: 50, event_index: 3 });
         assert_eq!(payload.key, Key::Custom(CustomKey { name: "item_id".into(), value: CustomValue::Bytes32(crate::types::Bytes32([0x11; 32])) }));
-        assert_eq!(payload.decoded_event, Some(DecodedEvent { block_number: 50, event_index: 3, event: json!({"palletName": "Content", "eventName": "PublishRevision"}) }));
+        assert_eq!(
+            payload.decoded_event,
+            Some(DecodedEvent {
+                block_number: 50,
+                event_index: 3,
+                event: crate::types::StoredEvent {
+                    spec_version: 1234,
+                    pallet_name: "Content".into(),
+                    event_name: "PublishRevision".into(),
+                    pallet_index: 42,
+                    variant_index: 1,
+                    event_index: 3,
+                    fields: json!({}),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn broadcast_event_update_only_notifies_matching_keys() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let subscribers = Arc::new(Mutex::new(HashMap::new()));
+            let (match_tx, mut match_rx) = mpsc::channel(1);
+            let (other_tx, mut other_rx) = mpsc::channel(1);
+
+            subscribers.lock().await.insert(
+                1,
+                EventSubscriber {
+                    key: custom_u32_key("ref_index", 42),
+                    sender: match_tx,
+                },
+            );
+            subscribers.lock().await.insert(
+                2,
+                EventSubscriber {
+                    key: custom_u32_key("ref_index", 7),
+                    sender: other_tx,
+                },
+            );
+
+            broadcast_event_update(
+                &subscribers,
+                EventNotification {
+                    key: custom_u32_key("ref_index", 42),
+                    event: EventRef {
+                        block_number: 10,
+                        event_index: 1,
+                    },
+                    decoded_event: None,
+                },
+            )
+            .await;
+
+            assert!(match_rx.recv().await.is_some());
+            assert!(other_rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn clone_error_preserves_response_channel_closed_payload() {
+        let cloned = clone_error(&IndexerApiError::ResponseChannelClosed { request_id: 44 });
+
+        match cloned {
+            IndexerApiError::ResponseChannelClosed { request_id } => assert_eq!(request_id, 44),
+            _ => panic!("unexpected error variant"),
+        }
     }
 }

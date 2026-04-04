@@ -32,11 +32,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     println!("{} matching events", events.events.len());
+    for event_match in events.event_matches() {
+        if let Some(decoded) = event_match.decoded_event {
+            println!("{}::{}", decoded.pallet_name(), decoded.event_name());
+        }
+    }
     Ok(())
 }
 ```
 
-## Example
+## Subscription Example
 
 ```rust
 use acuity_index_api_rs::{CustomKey, CustomValue, IndexerClient, Key};
@@ -48,18 +53,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spans = client.status().await?;
     println!("indexed spans: {spans:?}");
 
-    let events = client
-        .get_events(
-            Key::Custom(CustomKey {
-                name: "ref_index".into(),
-                value: CustomValue::U32(42),
-            }),
-            Some(100),
-            None,
-        )
+    let mut subscription = client
+        .subscribe_events(Key::Custom(CustomKey {
+            name: "ref_index".into(),
+            value: CustomValue::U32(42),
+        }))
         .await?;
 
-    println!("{} matching events", events.events.len());
+    while let Some(notification) = subscription.next().await {
+        let notification = notification?;
+        if let Some(decoded) = notification.decoded_event {
+            println!("{}::{}", decoded.pallet_name(), decoded.event_name());
+        }
+        break;
+    }
+
+    subscription.unsubscribe().await?;
     Ok(())
 }
 ```
+
+`subscribe_events` and `subscribe_status` return owned subscription handles. Dropping a handle removes only that local receiver. Calling `unsubscribe()` also sends the corresponding unsubscribe request to the server.

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -170,7 +171,19 @@ pub struct EventRef {
 pub struct DecodedEvent {
     pub block_number: u32,
     pub event_index: u16,
-    pub event: Value,
+    pub event: StoredEvent,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredEvent {
+    pub spec_version: u32,
+    pub pallet_name: String,
+    pub event_name: String,
+    pub pallet_index: u8,
+    pub variant_index: u8,
+    pub event_index: u16,
+    pub fields: Value,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -201,6 +214,12 @@ pub struct EventsResponse {
     pub decoded_events: Vec<DecodedEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventMatch {
+    pub event_ref: EventRef,
+    pub decoded_event: Option<DecodedEvent>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum SubscriptionTarget {
@@ -218,6 +237,56 @@ pub struct EventNotification {
     pub key: Key,
     pub event: EventRef,
     pub decoded_event: Option<DecodedEvent>,
+}
+
+impl StoredEvent {
+    pub fn field(&self, name: &str) -> Option<&Value> {
+        self.fields.get(name)
+    }
+
+    pub fn variant(&self) -> (u8, u8) {
+        (self.pallet_index, self.variant_index)
+    }
+}
+
+impl DecodedEvent {
+    pub fn pallet_name(&self) -> &str {
+        &self.event.pallet_name
+    }
+
+    pub fn event_name(&self) -> &str {
+        &self.event.event_name
+    }
+
+    pub fn variant(&self) -> (u8, u8) {
+        self.event.variant()
+    }
+
+    pub fn field(&self, name: &str) -> Option<&Value> {
+        self.event.field(name)
+    }
+}
+
+impl EventsResponse {
+    pub fn event_matches(&self) -> Vec<EventMatch> {
+        let decoded_by_ref: HashMap<(u32, u16), DecodedEvent> = self
+            .decoded_events
+            .iter()
+            .cloned()
+            .map(|decoded| ((decoded.block_number, decoded.event_index), decoded))
+            .collect();
+
+        self.events
+            .iter()
+            .cloned()
+            .map(|event_ref| EventMatch {
+                decoded_event: decoded_by_ref
+                    .get(&(event_ref.block_number, event_ref.event_index))
+                    .cloned(),
+                event_ref,
+            })
+            .collect()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -501,7 +570,15 @@ mod tests {
             "decodedEvents": [{
                 "blockNumber": 50,
                 "eventIndex": 3,
-                "event": {"palletName": "Referenda", "eventName": "Submitted"}
+                "event": {
+                    "specVersion": 1234,
+                    "palletName": "Referenda",
+                    "eventName": "Submitted",
+                    "palletIndex": 42,
+                    "variantIndex": 0,
+                    "eventIndex": 3,
+                    "fields": {"index": 42}
+                }
             }]
         }))
         .unwrap();
@@ -520,6 +597,57 @@ mod tests {
 
         assert_eq!(payload.events.len(), 1);
         assert!(payload.decoded_events.is_empty());
+    }
+
+    #[test]
+    fn stored_event_and_events_response_helpers_work() {
+        let payload = serde_json::from_value::<EventsResponse>(json!({
+            "key": {"type": "Custom", "value": {"name": "ref_index", "kind": "u32", "value": 42}},
+            "events": [
+                {"blockNumber": 50, "eventIndex": 3},
+                {"blockNumber": 49, "eventIndex": 1}
+            ],
+            "decodedEvents": [{
+                "blockNumber": 50,
+                "eventIndex": 3,
+                "event": {
+                    "specVersion": 1234,
+                    "palletName": "Referenda",
+                    "eventName": "Submitted",
+                    "palletIndex": 42,
+                    "variantIndex": 0,
+                    "eventIndex": 3,
+                    "fields": {"index": 42}
+                }
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(payload.decoded_events[0].pallet_name(), "Referenda");
+        assert_eq!(payload.decoded_events[0].event_name(), "Submitted");
+        assert_eq!(payload.decoded_events[0].variant(), (42, 0));
+        assert_eq!(payload.decoded_events[0].field("index"), Some(&json!(42)));
+
+        let matches = payload.event_matches();
+        assert_eq!(matches.len(), 2);
+        assert!(matches[0].decoded_event.is_some());
+        assert!(matches[1].decoded_event.is_none());
+    }
+
+    #[test]
+    fn stored_event_field_returns_none_for_non_object_fields() {
+        let event = StoredEvent {
+            spec_version: 1,
+            pallet_name: "Example".into(),
+            event_name: "Positional".into(),
+            pallet_index: 1,
+            variant_index: 2,
+            event_index: 3,
+            fields: json!([1, 2, 3]),
+        };
+
+        assert_eq!(event.variant(), (1, 2));
+        assert!(event.field("0").is_none());
     }
 
     #[test]
@@ -565,7 +693,15 @@ mod tests {
             "decodedEvent": {
                 "blockNumber": 50,
                 "eventIndex": 3,
-                "event": {"palletName": "Content", "eventName": "PublishRevision"}
+                "event": {
+                    "specVersion": 1234,
+                    "palletName": "Content",
+                    "eventName": "PublishRevision",
+                    "palletIndex": 42,
+                    "variantIndex": 1,
+                    "eventIndex": 3,
+                    "fields": {"revision_id": 1}
+                }
             }
         }))
         .unwrap();

@@ -22,8 +22,8 @@ pub enum IndexerApiError {
     Json(#[from] serde_json::Error),
     #[error("request {request_id} was cancelled")]
     RequestCancelled { request_id: u64 },
-    #[error("request {request_id} timed out waiting for a response")]
-    RequestChannelClosed { request_id: u64 },
+    #[error("request {request_id} response channel closed before a response arrived")]
+    ResponseChannelClosed { request_id: u64 },
     #[error("indexer returned error {code}: {message}")]
     Server { code: String, message: String },
     #[error("status subscription terminated ({reason}): {message}")]
