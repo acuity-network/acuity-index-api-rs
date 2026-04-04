@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Jonathan Brown"]
 description = "High-level Rust client for the acuity-index WebSocket API."
-license = "Apache-2.0"
+license = "MIT"
+repository = "https://github.com/jbrown/acuity-index-api-rs"
+homepage = "https://github.com/jbrown/acuity-index-api-rs"
+documentation = "https://docs.rs/acuity-index-api-rs"
 
 [dependencies]
 futures = "0.3"
