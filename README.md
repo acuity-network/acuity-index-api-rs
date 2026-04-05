@@ -4,11 +4,21 @@ High-level Rust client for the `acuity-index` WebSocket API.
 
 The indexer serves JSON-over-WebSocket on `ws://127.0.0.1:8172` by default.
 
+Recent `acuity-index` server versions enforce connection and request limits.
+Client integrations should expect connection attempts to fail under overload,
+oversized custom keys to be rejected, idle connections to be closed, and
+subscription requests beyond the per-connection cap to return a structured
+`subscription_limit` server error.
+
 ## Quick Start
 
 Add the crate to your `Cargo.toml`, connect to the indexer, and issue typed requests with `IndexerClient`.
 
+Architecture overview: [`ARCHITECTURE.md`](./ARCHITECTURE.md)
+
 Full API reference: [`API.md`](./API.md)
+
+Current server-side limits and failure modes are documented in [`API.md`](./API.md).
 
 ```rust
 use acuity_index_api_rs::{CustomKey, CustomValue, IndexerClient, Key};

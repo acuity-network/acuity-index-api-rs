@@ -85,6 +85,32 @@ Behavior:
 - returns a cloneable `IndexerClient`
 - intended to be reused for both one-shot requests and subscriptions on the same connection
 
+Operational notes for newer `acuity-index` servers:
+
+- a connection attempt can fail before the WebSocket session is established if the server is overloaded
+- overload rejection may surface as an HTTP `503 Service Unavailable` during `connect`
+- idle connections may be closed by the server after prolonged inactivity
+
+## Server Limits
+
+Current `acuity-index` servers may enforce these connection and request limits:
+
+- max WebSocket message size: `256 KiB`
+- max WebSocket frame size: `64 KiB`
+- max subscriptions per connection: `128`
+- idle timeout: `300s`
+- max custom key name length: `128` bytes
+- max custom string key length: `1024` bytes
+
+These limits are enforced by the server, not by this client crate.
+
+Practical implications:
+
+- `IndexerClient::connect(...)` can fail if the server rejects the upgrade under load
+- oversized custom keys used with `get_events(...)` or `subscribe_events(...)` can be rejected by the server
+- a connection with no inbound or outbound traffic can be closed by the server when the idle timeout is reached
+- a connection that exceeds the server subscription cap can receive a structured request error
+
 ## One-Shot Requests
 
 ### `status`
@@ -316,6 +342,7 @@ Notes:
 - dropping a `StatusSubscription` removes only that local receiver
 - `unsubscribe()` also sends `UnsubscribeStatus` to the server
 - `IndexerClient::unsubscribe_status()` removes all local status subscribers for that client connection and unsubscribes the shared server-side status subscription
+- if the shared connection is already at the server's per-connection subscription cap, `subscribe_status()` can fail with `IndexerApiError::Server { code, .. }` where `code` is `"subscription_limit"`
 
 `StatusUpdate`:
 
@@ -374,6 +401,8 @@ Notes:
 - notifications are delivered only to local subscribers whose `Key` matches the incoming notification key
 - `unsubscribe()` also sends `UnsubscribeEvents` for that key to the server
 - `IndexerClient::unsubscribe_events(key)` removes all local subscribers for that key and unsubscribes that key on the server for the shared connection
+- oversized custom key names or string values can be rejected by the server before the subscription is registered
+- if the shared connection is already at the server's per-connection subscription cap, `subscribe_events(...)` can fail with `IndexerApiError::Server { code, .. }` where `code` is `"subscription_limit"`
 
 `EventNotification`:
 
@@ -524,6 +553,7 @@ pub enum IndexerApiError {
 
 - `Server { .. }`
   - the indexer returned a structured protocol error
+  - one current example is `code == "subscription_limit"` when the server rejects a subscription beyond its per-connection cap
 - `UnexpectedResponseType { .. }`
   - the server replied to a request with a different response type than expected
 - `StatusSubscriptionTerminated { .. }`
@@ -531,7 +561,9 @@ pub enum IndexerApiError {
 - `EventSubscriptionTerminated { .. }`
   - the server terminated the event subscription
 - `ConnectionClosed`
-  - the socket closed while waiting for traffic
+  - the socket closed while waiting for traffic, including server-side idle timeout or normal close handling
+- `WebSocket(..)`
+  - the initial connection or a later protocol operation failed at the WebSocket layer, including upgrade rejection or close/error conditions surfaced by tungstenite
 - `ResponseChannelClosed { .. }`
   - the client-side waiter was dropped before a response arrived
 - `RequestCancelled { .. }`
@@ -566,6 +598,7 @@ Incoming protocol messages are interpreted as follows:
 - `eventNotification` notifications are routed to `EventSubscription`
 - `subscriptionTerminated` is surfaced as subscription errors
 - `error` with a matching `id` becomes `IndexerApiError::Server`
+- request-scoped server limit errors such as `subscription_limit` are surfaced through `IndexerApiError::Server`
 
 ## Current Notes
 
