@@ -69,6 +69,11 @@ impl IndexerClient {
         Ok(client)
     }
 
+    pub async fn close(&self) -> Result<(), IndexerApiError> {
+        self.writer.lock().await.close().await?;
+        Ok(())
+    }
+
     pub async fn status(&self) -> Result<Vec<Span>, IndexerApiError> {
         let envelope = self.request("Status", EmptyPayload::default()).await?;
         expect_payload::<Vec<Span>>(envelope, "status")
@@ -475,7 +480,9 @@ async fn broadcast_event_error(
     use super::*;
     use crate::types::{CustomKey, CustomValue, DecodedEvent, Envelope, EventRef};
     use serde_json::json;
+    use tokio::net::TcpListener;
     use tokio::sync::mpsc;
+    use tokio_tungstenite::accept_async;
 
     fn custom_u32_key(name: &str, value: u32) -> Key {
         Key::Custom(CustomKey {
@@ -963,5 +970,26 @@ async fn broadcast_event_error(
             IndexerApiError::ResponseChannelClosed { request_id } => assert_eq!(request_id, 44),
             _ => panic!("unexpected error variant"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_sends_websocket_close_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+
+            match websocket.next().await {
+                Some(Ok(Message::Close(_))) => {}
+                other => panic!("expected websocket close frame, got {other:?}"),
+            }
+        });
+
+        let client = IndexerClient::connect(&format!("ws://{addr}")).await.unwrap();
+        client.close().await.unwrap();
+
+        server.await.unwrap();
     }
 }

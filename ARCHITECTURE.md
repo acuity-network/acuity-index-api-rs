@@ -23,6 +23,8 @@ When `IndexerClient::connect(...)` is called:
 3. shared state is allocated behind `Arc<Mutex<...>>`
 4. a background Tokio task is spawned to continuously read and route incoming messages
 
+`IndexerClient::close()` uses the writer half to send a WebSocket close frame. The background reader then exits through the existing connection-shutdown path and fans the closure out to pending requests and subscriptions.
+
 This means the client has a split architecture:
 
 - foreground tasks call public async methods like `status()` or `get_events()` and write requests

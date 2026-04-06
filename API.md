@@ -85,6 +85,22 @@ Behavior:
 - returns a cloneable `IndexerClient`
 - intended to be reused for both one-shot requests and subscriptions on the same connection
 
+### `close`
+
+Closes the underlying WebSocket connection.
+
+Signature:
+
+```rust
+pub async fn close(&self) -> Result<(), IndexerApiError>
+```
+
+Behavior:
+
+- sends a WebSocket close frame on the shared connection
+- causes the background reader task to observe connection shutdown and terminate
+- any pending requests or active subscriptions on that client connection will complete with their normal connection-closure errors
+
 Operational notes for newer `acuity-index` servers:
 
 - a connection attempt can fail before the WebSocket session is established if the server is overloaded
