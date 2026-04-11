@@ -1,6 +1,6 @@
 [package]
 name = "acuity-index-api-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Jonathan Brown"]
 description = "High-level Rust client for the acuity-index WebSocket API."

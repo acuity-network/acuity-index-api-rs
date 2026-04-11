@@ -218,6 +218,47 @@ println!("database size: {bytes} bytes");
 
 ### `get_events`
 
+Custom keys support both scalar and flat composite values.
+
+Scalar custom key example:
+
+```json
+{
+  "id": 3,
+  "type": "GetEvents",
+  "key": {
+    "type": "Custom",
+    "value": {
+      "name": "ref_index",
+      "kind": "u32",
+      "value": 42
+    }
+  }
+}
+```
+
+Composite custom keys use an ordered array of typed scalar values:
+
+```json
+{
+  "id": 3,
+  "type": "GetEvents",
+  "key": {
+    "type": "Custom",
+    "value": {
+      "name": "item_revision",
+      "kind": "composite",
+      "value": [
+        {"kind": "bytes32", "value": "0xabc123..."},
+        {"kind": "u32", "value": 7}
+      ]
+    }
+  }
+}
+```
+
+Composite values are flat only in this crate: each element must be a scalar typed value, not another composite.
+
 Fetches indexed events for a given key.
 
 Signature:

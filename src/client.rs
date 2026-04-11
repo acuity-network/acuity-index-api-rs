@@ -478,7 +478,9 @@ async fn broadcast_event_error(
     #[cfg(test)]
     mod tests {
     use super::*;
-    use crate::types::{CustomKey, CustomValue, DecodedEvent, Envelope, EventRef};
+    use crate::types::{
+        CustomKey, CustomScalarValue, CustomValue, DecodedEvent, Envelope, EventRef,
+    };
     use serde_json::json;
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
@@ -488,6 +490,16 @@ async fn broadcast_event_error(
         Key::Custom(CustomKey {
             name: name.into(),
             value: CustomValue::U32(value),
+        })
+    }
+
+    fn composite_key(name: &str, bytes: u8, value: u32) -> Key {
+        Key::Custom(CustomKey {
+            name: name.into(),
+            value: CustomValue::Composite(vec![
+                CustomScalarValue::Bytes32(crate::types::Bytes32([bytes; 32])),
+                CustomScalarValue::U32(value),
+            ]),
         })
     }
 
@@ -948,6 +960,51 @@ async fn broadcast_event_error(
                 &subscribers,
                 EventNotification {
                     key: custom_u32_key("ref_index", 42),
+                    event: EventRef {
+                        block_number: 10,
+                        event_index: 1,
+                    },
+                    decoded_event: None,
+                },
+            )
+            .await;
+
+            assert!(match_rx.recv().await.is_some());
+            assert!(other_rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn broadcast_event_update_matches_composite_keys() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let subscribers = Arc::new(Mutex::new(HashMap::new()));
+            let (match_tx, mut match_rx) = mpsc::channel(1);
+            let (other_tx, mut other_rx) = mpsc::channel(1);
+
+            subscribers.lock().await.insert(
+                1,
+                EventSubscriber {
+                    key: composite_key("item_revision", 0x11, 7),
+                    sender: match_tx,
+                },
+            );
+            subscribers.lock().await.insert(
+                2,
+                EventSubscriber {
+                    key: composite_key("item_revision", 0x11, 8),
+                    sender: other_tx,
+                },
+            );
+
+            broadcast_event_update(
+                &subscribers,
+                EventNotification {
+                    key: composite_key("item_revision", 0x11, 7),
                     event: EventRef {
                         block_number: 10,
                         event_index: 1,

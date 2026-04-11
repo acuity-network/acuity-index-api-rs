@@ -2,6 +2,9 @@
 
 High-level Rust client for the `acuity-index` WebSocket API.
 
+Supports scalar custom keys and flat composite custom keys built from ordered
+typed scalar values.
+
 The indexer serves JSON-over-WebSocket on `ws://127.0.0.1:8172` by default.
 
 Recent `acuity-index` server versions enforce connection and request limits.
@@ -21,7 +24,7 @@ Full API reference: [`API.md`](./API.md)
 Current server-side limits and failure modes are documented in [`API.md`](./API.md).
 
 ```rust
-use acuity_index_api_rs::{CustomKey, CustomValue, IndexerClient, Key};
+use acuity_index_api_rs::{CustomKey, CustomScalarValue, IndexerClient, Key};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,10 +35,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let events = client
         .get_events(
-            Key::Custom(CustomKey {
-                name: "ref_index".into(),
-                value: CustomValue::U32(42),
-            }),
+            Key::Custom(CustomKey::composite(
+                "item_revision",
+                [
+                    CustomScalarValue::Bytes32([0x11; 32].into()),
+                    CustomScalarValue::U32(7),
+                ],
+            )),
             Some(100),
             None,
         )
@@ -54,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Subscription Example
 
 ```rust
-use acuity_index_api_rs::{CustomKey, CustomValue, IndexerClient, Key};
+use acuity_index_api_rs::{CustomKey, CustomScalarValue, IndexerClient, Key};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,10 +70,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("indexed spans: {spans:?}");
 
     let mut subscription = client
-        .subscribe_events(Key::Custom(CustomKey {
-            name: "ref_index".into(),
-            value: CustomValue::U32(42),
-        }))
+        .subscribe_events(Key::Custom(CustomKey::composite(
+            "item_revision",
+            [
+                CustomScalarValue::Bytes32([0x11; 32].into()),
+                CustomScalarValue::U32(7),
+            ],
+        )))
         .await?;
 
     while let Some(notification) = subscription.next().await {

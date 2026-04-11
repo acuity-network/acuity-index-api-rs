@@ -17,6 +17,25 @@ pub struct CustomKey {
     pub value: CustomValue,
 }
 
+impl CustomKey {
+    pub fn scalar(name: impl Into<String>, value: CustomValue) -> Self {
+        Self {
+            name: name.into(),
+            value,
+        }
+    }
+
+    pub fn composite(
+        name: impl Into<String>,
+        values: impl IntoIterator<Item = CustomScalarValue>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            value: CustomValue::Composite(values.into_iter().collect()),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Bytes32(pub [u8; 32]);
 
@@ -41,6 +60,12 @@ impl<'de> Deserialize<'de> for Bytes32 {
             .try_into()
             .map_err(|_| serde::de::Error::custom("expected 32 bytes"))?;
         Ok(Self(arr))
+    }
+}
+
+impl From<[u8; 32]> for Bytes32 {
+    fn from(value: [u8; 32]) -> Self {
+        Self(value)
     }
 }
 
@@ -151,6 +176,18 @@ impl<'de> Deserialize<'de> for U128Text {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum CustomValue {
+    Bytes32(Bytes32),
+    U32(u32),
+    U64(U64Text),
+    U128(U128Text),
+    String(String),
+    Bool(bool),
+    Composite(Vec<CustomScalarValue>),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum CustomScalarValue {
     Bytes32(Bytes32),
     U32(u32),
     U64(U64Text),
@@ -458,6 +495,87 @@ mod tests {
     }
 
     #[test]
+    fn custom_key_scalar_constructor_preserves_scalar_value() {
+        assert_eq!(
+            CustomKey::scalar("ref_index", CustomValue::U32(42)),
+            CustomKey {
+                name: "ref_index".into(),
+                value: CustomValue::U32(42),
+            }
+        );
+    }
+
+    #[test]
+    fn custom_key_composite_constructor_collects_values() {
+        assert_eq!(
+            CustomKey::composite(
+                "item_revision",
+                [
+                    CustomScalarValue::Bytes32([0x11; 32].into()),
+                    CustomScalarValue::U32(7),
+                ],
+            ),
+            CustomKey {
+                name: "item_revision".into(),
+                value: CustomValue::Composite(vec![
+                    CustomScalarValue::Bytes32(Bytes32([0x11; 32])),
+                    CustomScalarValue::U32(7),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn custom_key_composite_constructor_allows_empty_values() {
+        assert_eq!(
+            CustomKey::composite("empty", std::iter::empty()),
+            CustomKey {
+                name: "empty".into(),
+                value: CustomValue::Composite(vec![]),
+            }
+        );
+    }
+
+    #[test]
+    fn custom_value_serializes_flat_composite_values() {
+        let value = CustomValue::Composite(vec![
+            CustomScalarValue::Bytes32(Bytes32([0xAB; 32])),
+            CustomScalarValue::U32(7),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(value).unwrap(),
+            json!({
+                "kind": "composite",
+                "value": [
+                    {"kind": "bytes32", "value": bytes32_hex(0xAB)},
+                    {"kind": "u32", "value": 7}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn custom_value_rejects_nested_composites() {
+        let error = serde_json::from_value::<CustomValue>(json!({
+            "kind": "composite",
+            "value": [
+                {"kind": "u32", "value": 7},
+                {
+                    "kind": "composite",
+                    "value": [
+                        {"kind": "bool", "value": true}
+                    ]
+                }
+            ]
+        }))
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("unknown variant `composite`"));
+    }
+
+    #[test]
     fn key_deserializes_variant_and_custom_shapes() {
         let variant =
             serde_json::from_value::<Key>(json!({"type": "Variant", "value": [5, 3]})).unwrap();
@@ -473,6 +591,33 @@ mod tests {
             Key::Custom(CustomKey {
                 name: "published".into(),
                 value: CustomValue::Bool(true),
+            })
+        );
+    }
+
+    #[test]
+    fn key_deserializes_composite_custom_shape() {
+        let custom = serde_json::from_value::<Key>(json!({
+            "type": "Custom",
+            "value": {
+                "name": "item_revision",
+                "kind": "composite",
+                "value": [
+                    {"kind": "bytes32", "value": bytes32_hex(0x11)},
+                    {"kind": "u32", "value": 7}
+                ]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            custom,
+            Key::Custom(CustomKey {
+                name: "item_revision".into(),
+                value: CustomValue::Composite(vec![
+                    CustomScalarValue::Bytes32(Bytes32([0x11; 32])),
+                    CustomScalarValue::U32(7),
+                ]),
             })
         );
     }
@@ -545,6 +690,33 @@ mod tests {
     }
 
     #[test]
+    fn serializes_get_events_request_with_composite_custom_key() {
+        let request = RequestMessage {
+            id: 5,
+            message_type: "GetEvents",
+            payload: GetEventsPayload {
+                key: Key::Custom(CustomKey {
+                    name: "item_revision".into(),
+                    value: CustomValue::Composite(vec![
+                        CustomScalarValue::Bytes32(Bytes32([0x12; 32])),
+                        CustomScalarValue::U32(7),
+                    ]),
+                }),
+                limit: None,
+                before: None,
+            },
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["key"]["value"]["kind"], "composite");
+        assert_eq!(json["key"]["value"]["value"][0]["kind"], "bytes32");
+        assert_eq!(
+            json["key"]["value"]["value"][1],
+            json!({"kind": "u32", "value": 7})
+        );
+    }
+
+    #[test]
     fn serializes_subscribe_events_request_in_server_shape() {
         let request = RequestMessage {
             id: 7,
@@ -560,6 +732,27 @@ mod tests {
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["type"], "SubscribeEvents");
         assert_eq!(json["key"]["value"]["kind"], "bytes32");
+    }
+
+    #[test]
+    fn serializes_subscribe_events_request_with_composite_custom_key() {
+        let request = RequestMessage {
+            id: 8,
+            message_type: "SubscribeEvents",
+            payload: SubscribeEventsPayload {
+                key: Key::Custom(CustomKey {
+                    name: "item_revision".into(),
+                    value: CustomValue::Composite(vec![
+                        CustomScalarValue::Bytes32(Bytes32([0xAB; 32])),
+                        CustomScalarValue::U32(9),
+                    ]),
+                }),
+            },
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["type"], "SubscribeEvents");
+        assert_eq!(json["key"]["value"]["kind"], "composite");
     }
 
     #[test]
@@ -597,6 +790,36 @@ mod tests {
 
         assert_eq!(payload.events.len(), 1);
         assert!(payload.decoded_events.is_empty());
+    }
+
+    #[test]
+    fn deserializes_events_response_with_composite_key() {
+        let payload = serde_json::from_value::<EventsResponse>(json!({
+            "key": {
+                "type": "Custom",
+                "value": {
+                    "name": "item_revision",
+                    "kind": "composite",
+                    "value": [
+                        {"kind": "bytes32", "value": bytes32_hex(0x11)},
+                        {"kind": "u32", "value": 7}
+                    ]
+                }
+            },
+            "events": [{"blockNumber": 50, "eventIndex": 3}]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            payload.key,
+            Key::Custom(CustomKey {
+                name: "item_revision".into(),
+                value: CustomValue::Composite(vec![
+                    CustomScalarValue::Bytes32(Bytes32([0x11; 32])),
+                    CustomScalarValue::U32(7),
+                ]),
+            })
+        );
     }
 
     #[test]
@@ -671,6 +894,41 @@ mod tests {
     }
 
     #[test]
+    fn deserializes_subscription_status_payload_with_composite_key() {
+        let payload = serde_json::from_value::<SubscriptionStatusPayload>(json!({
+            "action": "subscribed",
+            "target": {
+                "type": "events",
+                "key": {
+                    "type": "Custom",
+                    "value": {
+                        "name": "item_revision",
+                        "kind": "composite",
+                        "value": [
+                            {"kind": "bytes32", "value": bytes32_hex(0x11)},
+                            {"kind": "u32", "value": 7}
+                        ]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            payload.target,
+            SubscriptionTarget::Events {
+                key: Key::Custom(CustomKey {
+                    name: "item_revision".into(),
+                    value: CustomValue::Composite(vec![
+                        CustomScalarValue::Bytes32(Bytes32([0x11; 32])),
+                        CustomScalarValue::U32(7),
+                    ]),
+                })
+            }
+        );
+    }
+
+    #[test]
     fn deserializes_subscription_terminated_payload() {
         let payload = serde_json::from_value::<SubscriptionTerminatedPayload>(json!({
             "reason": "backpressure",
@@ -708,6 +966,37 @@ mod tests {
 
         assert_eq!(payload.event.block_number, 50);
         assert!(payload.decoded_event.is_some());
+    }
+
+    #[test]
+    fn deserializes_event_notification_payload_with_composite_key() {
+        let payload = serde_json::from_value::<EventNotificationPayload>(json!({
+            "key": {
+                "type": "Custom",
+                "value": {
+                    "name": "item_revision",
+                    "kind": "composite",
+                    "value": [
+                        {"kind": "bytes32", "value": bytes32_hex(0x11)},
+                        {"kind": "u32", "value": 7}
+                    ]
+                }
+            },
+            "event": {"blockNumber": 50, "eventIndex": 3},
+            "decodedEvent": null
+        }))
+        .unwrap();
+
+        assert_eq!(
+            payload.key,
+            Key::Custom(CustomKey {
+                name: "item_revision".into(),
+                value: CustomValue::Composite(vec![
+                    CustomScalarValue::Bytes32(Bytes32([0x11; 32])),
+                    CustomScalarValue::U32(7),
+                ]),
+            })
+        );
     }
 
     #[test]
